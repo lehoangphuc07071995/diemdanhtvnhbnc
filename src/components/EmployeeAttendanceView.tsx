@@ -7,16 +7,13 @@ import {
   Clock,
   Copy,
   Download,
-  ExternalLink,
   History,
   LogIn,
   LogOut,
   LogOut as ExitIcon,
   MapPin,
-  Navigation,
   RefreshCw,
   Search,
-  ShieldCheck,
   User,
   X,
 } from 'lucide-react';
@@ -71,7 +68,7 @@ interface EmployeeAttendanceViewProps {
 
 type EmployeeTab = 'checkin' | 'history' | 'profile';
 type HistoryRangePreset = 'all' | DateRangePreset;
-type FlowStep = 'idle' | 'gps_checking' | 'gps_ready' | 'camera_live' | 'submitting' | 'receipt';
+type FlowStep = 'idle' | 'camera_live' | 'submitting' | 'receipt';
 
 interface GpsReading {
   latitude: number;
@@ -79,6 +76,130 @@ interface GpsReading {
   accuracy: number;
   distance: number;
   address: string;
+}
+
+interface DailyShiftCard {
+  id: string;
+  dateKey: string;
+  dateLabel: string;
+  checkIn: AttendanceLog | null;
+  checkOut: AttendanceLog | null;
+  durationLabel: string;
+}
+
+function formatSimpleLocationStatus(status: GeofenceStatus): {
+  label: string;
+  className: string;
+} {
+  if (status === 'valid') {
+    return { label: 'Đúng vị trí', className: 'text-emerald-700' };
+  }
+  if (status === 'out_of_range_noted') {
+    return { label: 'Ngoài khu vực (có lý do)', className: 'text-amber-700' };
+  }
+  return { label: 'Ngoài vị trí', className: 'text-rose-700' };
+}
+
+function formatWeekdayDateVN(dateKey: string): string {
+  const d = new Date(`${dateKey}T12:00:00+07:00`);
+  if (Number.isNaN(d.getTime())) return dateKey;
+  return new Intl.DateTimeFormat('vi-VN', {
+    timeZone: 'Asia/Ho_Chi_Minh',
+    weekday: 'long',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+  }).format(d);
+}
+
+function buildDailyShiftCards(logs: AttendanceLog[], todayKey: string): DailyShiftCard[] {
+  const byDate = new Map<string, AttendanceLog[]>();
+  const chronological = [...logs].sort(
+    (a, b) =>
+      new Date(a.server_timestamp).getTime() - new Date(b.server_timestamp).getTime()
+  );
+
+  for (const log of chronological) {
+    const key = getVNDateKey(log.server_timestamp);
+    const list = byDate.get(key) || [];
+    list.push(log);
+    byDate.set(key, list);
+  }
+
+  const cards: DailyShiftCard[] = [];
+  const sortedDates = Array.from(byDate.keys()).sort((a, b) => b.localeCompare(a));
+
+  for (const dateKey of sortedDates) {
+    const dayLogs = byDate.get(dateKey) || [];
+    const dateLabel = formatWeekdayDateVN(dateKey);
+    let pendingIn: AttendanceLog | null = null;
+    let pairIndex = 0;
+
+    for (const log of dayLogs) {
+      if (log.action === 'check_in') {
+        if (pendingIn) {
+          cards.push({
+            id: `${dateKey}-${pairIndex++}`,
+            dateKey,
+            dateLabel,
+            checkIn: pendingIn,
+            checkOut: null,
+            durationLabel: 'Chưa chấm ra ca',
+          });
+        }
+        pendingIn = log;
+      } else if (log.action === 'check_out') {
+        if (pendingIn) {
+          const diffHrs = Math.max(
+            0,
+            (new Date(log.server_timestamp).getTime() -
+              new Date(pendingIn.server_timestamp).getTime()) /
+              3600000
+          );
+          cards.push({
+            id: `${dateKey}-${pairIndex++}`,
+            dateKey,
+            dateLabel,
+            checkIn: pendingIn,
+            checkOut: log,
+            durationLabel: `${diffHrs.toFixed(1)} giờ`,
+          });
+          pendingIn = null;
+        } else {
+          cards.push({
+            id: `${dateKey}-${pairIndex++}`,
+            dateKey,
+            dateLabel,
+            checkIn: null,
+            checkOut: log,
+            durationLabel: 'Chỉ ghi nhận ra ca',
+          });
+        }
+      }
+    }
+
+    if (pendingIn) {
+      cards.push({
+        id: `${dateKey}-${pairIndex++}`,
+        dateKey,
+        dateLabel,
+        checkIn: pendingIn,
+        checkOut: null,
+        durationLabel: dateKey === todayKey ? 'Đang trong ca' : 'Chưa chấm ra ca',
+      });
+    }
+  }
+
+  // Sort newest shift first
+  return cards.sort((a, b) => {
+    const aTime = new Date(
+      (a.checkOut || a.checkIn)!.server_timestamp
+    ).getTime();
+    const bTime = new Date(
+      (b.checkOut || b.checkIn)!.server_timestamp
+    ).getTime();
+    return bTime - aTime;
+  });
 }
 
 export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
@@ -109,9 +230,10 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
   );
   const [copiedSummary, setCopiedSummary] = useState<boolean>(false);
 
-  // Flow state
+  // Unified Camera + GPS Flow state
   const [pendingAction, setPendingAction] = useState<AttendanceAction>('check_in');
   const [flowStep, setFlowStep] = useState<FlowStep>('idle');
+  const [gpsLoading, setGpsLoading] = useState<boolean>(false);
   const [gpsReading, setGpsReading] = useState<GpsReading | null>(null);
   const [gpsError, setGpsError] = useState<string>('');
   const [outOfRangeNote, setOutOfRangeNote] = useState<string>('');
@@ -201,9 +323,23 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
     [myLogs, todayKey]
   );
 
+  const todayCheckInLog = useMemo(
+    () => todayLogs.find((l) => l.action === 'check_in') || null,
+    [todayLogs]
+  );
+  const todayCheckOutLog = useMemo(
+    () => todayLogs.find((l) => l.action === 'check_out') || null,
+    [todayLogs]
+  );
+
   const latestTodayLog = todayLogs[0] || null;
   const isCurrentlyInShift = latestTodayLog?.action === 'check_in';
   const hasCompletedToday = latestTodayLog?.action === 'check_out';
+
+  const dailyShiftCards = useMemo(
+    () => buildDailyShiftCards(filteredMyLogs, todayKey),
+    [filteredMyLogs, todayKey]
+  );
 
   const monthStartKey = `${todayKey.slice(0, 7)}-01`;
   const monthSummary = useMemo(() => {
@@ -217,14 +353,14 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
     return rows[0];
   }, [employee, logs, settings, monthStartKey, todayKey]);
 
-  const acquireGps = useCallback(async () => {
-    setFlowStep('gps_checking');
+  const acquireGps = useCallback(() => {
+    setGpsLoading(true);
     setGpsError('');
     setGpsReading(null);
 
     if (!navigator.geolocation) {
-      setGpsError('Thiết bị hoặc trình duyệt này không hỗ trợ định vị GPS.');
-      setFlowStep('gps_ready');
+      setGpsError('Thiết bị này không hỗ trợ định vị GPS.');
+      setGpsLoading(false);
       return;
     }
 
@@ -247,21 +383,21 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
           distance: dist,
           address,
         });
-        setFlowStep('gps_ready');
+        setGpsLoading(false);
       },
       (err) => {
-        let msg = 'Không thể lấy tọa độ GPS chính xác.';
+        let msg = 'Chưa lấy được vị trí GPS.';
         if (err.code === err.PERMISSION_DENIED) {
           msg =
-            'Trình duyệt đã bị từ chối quyền truy cập Vị trí (GPS). Vui lòng cấp quyền định vị và thử lại.';
+            'Bạn chưa cho phép quyền Vị trí (GPS). Vui lòng bật Vị trí trên điện thoại và cho phép trình duyệt truy cập.';
         } else if (err.code === err.TIMEOUT) {
           msg =
-            'Hết thời gian chờ tín hiệu GPS chính xác cao (10 giây). Vui lòng di chuyển ra khu vực thoáng hơn.';
+            'Tín hiệu GPS hơi yếu. Vui lòng đứng ra chỗ thoáng hơn rồi bấm "Lấy lại vị trí".';
         } else if (err.code === err.POSITION_UNAVAILABLE) {
-          msg = 'Không tìm thấy tín hiệu vệ tinh / vị trí trên thiết bị này.';
+          msg = 'Chưa bật định vị GPS trên điện thoại.';
         }
         setGpsError(msg);
-        setFlowStep('gps_ready');
+        setGpsLoading(false);
       },
       {
         enableHighAccuracy: true,
@@ -271,77 +407,13 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
     );
   }, [settings.latitude, settings.longitude]);
 
-  const startAttendanceFlow = useCallback(
-    (action: AttendanceAction) => {
-      setPendingAction(action);
-      setOutOfRangeNote('');
-      setCameraError('');
-      setSubmitError('');
-      setReceiptLog(null);
-      acquireGps();
-    },
-    [acquireGps]
-  );
-
-  useEffect(() => {
-    if (autoStartAction) {
-      startAttendanceFlow(autoStartAction);
-      onAutoStartConsumed?.();
-    }
-  }, [autoStartAction, onAutoStartConsumed, startAttendanceFlow]);
-
-  const handleUseDemoOfficeGps = async () => {
-    setFlowStep('gps_checking');
-    setGpsError('');
-    const lat = settings.latitude + 0.00008;
-    const lng = settings.longitude + 0.00006;
-    const dist = haversineDistanceMeters(
-      lat,
-      lng,
-      settings.latitude,
-      settings.longitude
-    );
-    const addr = settings.office_address;
-    setGpsReading({
-      latitude: lat,
-      longitude: lng,
-      accuracy: 12,
-      distance: dist,
-      address: addr,
-    });
-    setFlowStep('gps_ready');
-  };
-
-  const isAccuracyValid = gpsReading
-    ? gpsReading.accuracy <= settings.max_gps_accuracy_m
-    : false;
-  const isInsideGeofence = gpsReading
-    ? gpsReading.distance <= settings.geofence_radius_m
-    : false;
-  const requiresNote = Boolean(
-    gpsReading &&
-      isAccuracyValid &&
-      !isInsideGeofence &&
-      settings.allow_out_of_office_with_note
-  );
-  const canProceedToCamera = Boolean(
-    gpsReading &&
-      isAccuracyValid &&
-      (isInsideGeofence ||
-        (settings.allow_out_of_office_with_note &&
-          outOfRangeNote.trim().length >= 8))
-  );
-
   const openLiveCamera = useCallback(async () => {
-    setFlowStep('camera_live');
     setCameraError('');
     setCameraReady(false);
     stopCameraStream();
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      setCameraError(
-        'Trình duyệt không hỗ trợ mở camera trực tiếp (getUserMedia).'
-      );
+      setCameraError('Trình duyệt không hỗ trợ mở camera trực tiếp.');
       return;
     }
 
@@ -362,15 +434,77 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
       }
     } catch (err) {
       const message =
-        err instanceof Error ? err.message : 'Không thể truy cập camera trước';
+        err instanceof Error ? err.message : 'Chưa được cấp quyền Camera';
       setCameraError(
-        `Không mở được camera trực tiếp: ${message}. Vui lòng cấp quyền Camera để chụp ảnh xác thực.`
+        `Không mở được camera: ${message}. Vui lòng bấm Cho phép Camera để chụp ảnh.`
       );
     }
   }, [stopCameraStream]);
 
+  // Unified 1-step flow: open Camera immediately AND lock GPS in parallel
+  const startAttendanceFlow = useCallback(
+    (action: AttendanceAction) => {
+      setPendingAction(action);
+      setOutOfRangeNote('');
+      setCameraError('');
+      setSubmitError('');
+      setReceiptLog(null);
+      setFlowStep('camera_live');
+      acquireGps();
+      openLiveCamera();
+    },
+    [acquireGps, openLiveCamera]
+  );
+
+  useEffect(() => {
+    if (autoStartAction) {
+      startAttendanceFlow(autoStartAction);
+      onAutoStartConsumed?.();
+    }
+  }, [autoStartAction, onAutoStartConsumed, startAttendanceFlow]);
+
+  const handleUseDemoOfficeGps = () => {
+    setGpsError('');
+    setGpsLoading(false);
+    const lat = settings.latitude + 0.00008;
+    const lng = settings.longitude + 0.00006;
+    const dist = haversineDistanceMeters(
+      lat,
+      lng,
+      settings.latitude,
+      settings.longitude
+    );
+    setGpsReading({
+      latitude: lat,
+      longitude: lng,
+      accuracy: 12,
+      distance: dist,
+      address: settings.office_address,
+    });
+  };
+
+  const isAccuracyValid = gpsReading
+    ? gpsReading.accuracy <= settings.max_gps_accuracy_m
+    : false;
+  const isInsideGeofence = gpsReading
+    ? gpsReading.distance <= settings.geofence_radius_m
+    : false;
+  const requiresNote = Boolean(
+    gpsReading &&
+      isAccuracyValid &&
+      !isInsideGeofence &&
+      settings.allow_out_of_office_with_note
+  );
+  const canProceedToCapture = Boolean(
+    gpsReading &&
+      isAccuracyValid &&
+      (isInsideGeofence ||
+        (settings.allow_out_of_office_with_note &&
+          outOfRangeNote.trim().length >= 8))
+  );
+
   const handleCaptureAndConfirm = async (useFallbackDemoCanvas = false) => {
-    if (!gpsReading) return;
+    if (!gpsReading || !canProceedToCapture) return;
     setSubmitError('');
 
     const deviceTimestamp = new Date().toISOString();
@@ -382,7 +516,6 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
     if (!useFallbackDemoCanvas && videoRef.current && cameraReady) {
       sourceEl = videoRef.current;
     } else if (useFallbackDemoCanvas && isDemoMode) {
-      // Fallback canvas only when hardware camera is absent in Demo Mode
       const fallbackCanvas = document.createElement('canvas');
       fallbackCanvas.width = 960;
       fallbackCanvas.height = 720;
@@ -394,18 +527,14 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
         ctx.fillRect(40, 40, 880, 640);
         ctx.fillStyle = '#E2E8F0';
         ctx.font = 'bold 30px "Plus Jakarta Sans", sans-serif';
-        ctx.fillText('KHUNG HÌNH XÁC THỰC DEMO', 240, 320);
-        ctx.font = '20px "Plus Jakarta Sans", sans-serif';
+        ctx.fillText('ẢNH XÁC THỰC CHẾ ĐỘ DEMO', 240, 320);
+        ctx.font = '22px "Plus Jakarta Sans", sans-serif';
         ctx.fillStyle = '#94A3B8';
-        ctx.fillText(
-          `${employee.full_name} (${employee.employee_code})`,
-          310,
-          370
-        );
+        ctx.fillText(employee.full_name, 330, 370);
       }
       sourceEl = fallbackCanvas;
     } else {
-      setSubmitError('Camera chưa sẵn sàng. Vui lòng thử lại.');
+      setSubmitError('Camera đang bật, vui lòng chờ 1 giây rồi bấm lại.');
       return;
     }
 
@@ -451,7 +580,7 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
       setSubmitError(
         err instanceof Error
           ? err.message
-          : 'Gửi dữ liệu chấm công thất bại. Vui lòng thử lại.'
+          : 'Lưu điểm danh chưa thành công. Vui lòng thử lại.'
       );
       setFlowStep('camera_live');
     }
@@ -460,6 +589,7 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
   const closeFlow = () => {
     stopCameraStream();
     setFlowStep('idle');
+    setGpsLoading(false);
     setGpsReading(null);
     setGpsError('');
     setCameraError('');
@@ -482,8 +612,25 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
     year: 'numeric',
   }).format(now);
 
+  // Determine clear capture button label
+  const captureButtonLabel = (() => {
+    if (flowStep === 'submitting') return 'Đang chụp & lưu ghi nhận...';
+    if (gpsLoading) return 'Đang lấy vị trí GPS...';
+    if (!gpsReading || !isAccuracyValid) return 'Chưa có vị trí hợp lệ';
+    if (!isInsideGeofence && !settings.allow_out_of_office_with_note) {
+      return 'Đang ở ngoài khu vực làm việc';
+    }
+    if (requiresNote && outOfRangeNote.trim().length < 8) {
+      return 'Vui lòng nhập lý do bên trên';
+    }
+    if (!cameraReady) return 'Đang bật Camera...';
+    return pendingAction === 'check_in'
+      ? 'CHỤP ẢNH & LƯU VÀO CA'
+      : 'CHỤP ẢNH & LƯU RA CA';
+  })();
+
   return (
-    <div className="mx-auto w-full max-w-6xl px-3.5 pt-3.5 pb-24 sm:px-6 sm:pt-5 lg:pb-10">
+    <div className="mx-auto w-full max-w-5xl px-3.5 pt-3.5 pb-24 sm:px-6 sm:pt-5 lg:pb-10">
       {/* Mobile compact identity header */}
       <div className="mb-3.5 flex items-center justify-between gap-2.5 rounded-2xl border border-slate-200 bg-white px-3.5 py-2.5 md:hidden">
         <div className="flex min-w-0 items-center gap-2.5">
@@ -496,23 +643,20 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
             <p className="truncate text-sm font-bold text-slate-900">
               {employee.full_name}
             </p>
-            <p className="font-mono text-[11px] text-slate-500">
-              {employee.employee_code} ·{' '}
-              <span
-                className={`font-semibold ${
-                  isCurrentlyInShift
-                    ? 'text-emerald-700'
-                    : hasCompletedToday
-                      ? 'text-indigo-700'
-                      : 'text-slate-600'
-                }`}
-              >
-                {isCurrentlyInShift
-                  ? 'Đang trong ca'
+            <p
+              className={`text-xs font-semibold ${
+                isCurrentlyInShift
+                  ? 'text-emerald-700'
                   : hasCompletedToday
-                    ? 'Đã ra ca'
-                    : 'Chưa vào ca'}
-              </span>
+                    ? 'text-indigo-700'
+                    : 'text-slate-500'
+              }`}
+            >
+              {isCurrentlyInShift
+                ? `Đang làm việc · Vào lúc ${formatTimeVN(latestTodayLog.server_timestamp)}`
+                : hasCompletedToday
+                  ? `Đã xong ca · Ra lúc ${formatTimeVN(latestTodayLog.server_timestamp)}`
+                  : 'Chưa chấm vào ca hôm nay'}
             </p>
           </div>
         </div>
@@ -526,7 +670,7 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
         </button>
       </div>
 
-      {/* Desktop inline view switcher (mobile uses fixed bottom bar) */}
+      {/* Desktop inline view switcher */}
       <div className="mb-6 hidden items-center justify-between gap-4 border-b border-slate-200 pb-4 md:flex">
         <div className="flex items-center gap-3.5">
           <img
@@ -536,10 +680,10 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
           />
           <div>
             <h1 className="text-xl font-bold text-slate-900">
-              Điểm danh Cá nhân · {employee.full_name}
+              {employee.full_name}
             </h1>
             <p className="mt-0.5 text-sm text-slate-500">
-              Mã NV: {employee.employee_code} · Bộ phận {employee.department} · Ca chuẩn {settings.shift_start_time} – {settings.shift_end_time}
+              {employee.department} · Giờ làm chuẩn {settings.shift_start_time} – {settings.shift_end_time}
             </p>
           </div>
         </div>
@@ -555,7 +699,7 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
                   : 'text-slate-600 hover:text-slate-900'
               }`}
             >
-              Chấm công 1 chạm
+              Chấm công
             </button>
             <button
               type="button"
@@ -566,7 +710,7 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
                   : 'text-slate-600 hover:text-slate-900'
               }`}
             >
-              Lịch sử chấm công ({myLogs.length})
+              Vào / Ra & Lịch sử ({myLogs.length})
             </button>
             <button
               type="button"
@@ -577,7 +721,7 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
                   : 'text-slate-600 hover:text-slate-900'
               }`}
             >
-              Công & Thu nhập tạm tính
+              Cá nhân
             </button>
           </div>
           <button
@@ -591,50 +735,49 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
         </div>
       </div>
 
-      {/* TAB 1: 1-TAP CHECK-IN / CHECK-OUT */}
+      {/* TAB 1: SIMPLE 1-TAP CHECK-IN / CHECK-OUT */}
       {activeTab === 'checkin' && (
-        <div className="grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-12">
-          {/* Primary Action Column */}
-          <div className="space-y-4 sm:space-y-5 lg:col-span-7">
-            <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
-              <div className="flex flex-wrap items-center justify-between gap-3 bg-gradient-to-r from-[#0B1E36] to-[#122D4F] px-4 py-4 text-white sm:px-7 sm:py-6">
-                <div>
-                  <p className="text-xs font-medium text-slate-300 capitalize">
-                    {vnDateString}
-                  </p>
-                  <p className="mt-0.5 font-mono text-3xl font-bold tracking-tight text-white tabular-nums sm:mt-1 sm:text-5xl">
-                    {vnTimeString}
-                  </p>
-                </div>
-
-                <div className="text-left sm:text-right">
-                  <p className="text-xs text-slate-300">Trạng thái ca hiện tại</p>
-                  {isCurrentlyInShift ? (
-                    <p className="mt-1 inline-flex items-center gap-1.5 text-sm font-bold text-emerald-300">
-                      <CheckCircle2 className="h-4 w-4" />
-                      <span>
-                        Đang trong ca từ {formatTimeVN(latestTodayLog.server_timestamp)}
-                      </span>
-                    </p>
-                  ) : hasCompletedToday ? (
-                    <p className="mt-1 inline-flex items-center gap-1.5 text-sm font-bold text-amber-300">
-                      <ShieldCheck className="h-4 w-4" />
-                      <span>
-                        Đã hoàn thành ca lúc {formatTimeVN(latestTodayLog.server_timestamp)}
-                      </span>
-                    </p>
-                  ) : (
-                    <p className="mt-1 inline-flex items-center gap-1.5 text-sm font-semibold text-slate-200">
-                      <Clock className="h-4 w-4 text-slate-300" />
-                      <span>Chưa vào ca hôm nay</span>
-                    </p>
-                  )}
-                </div>
+        <div className="space-y-4 sm:space-y-5">
+          {/* Clock & Main Action Card */}
+          <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
+            <div className="flex flex-wrap items-center justify-between gap-3 bg-gradient-to-r from-[#0B1E36] to-[#122D4F] px-4 py-4 text-white sm:px-7 sm:py-6">
+              <div>
+                <p className="text-xs font-medium text-slate-300 capitalize">
+                  {vnDateString}
+                </p>
+                <p className="mt-0.5 font-mono text-3xl font-bold tracking-tight text-white tabular-nums sm:mt-1 sm:text-5xl">
+                  {vnTimeString}
+                </p>
               </div>
 
-              <div className="p-4 sm:p-7">
-                {/* 1-Tap High Contrast Action Buttons */}
-                <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2">
+              <div className="text-left sm:text-right">
+                <p className="text-xs text-slate-300">Trạng thái hôm nay</p>
+                {isCurrentlyInShift ? (
+                  <p className="mt-1 inline-flex items-center gap-1.5 text-sm font-bold text-emerald-300 sm:text-base">
+                    <CheckCircle2 className="h-4 w-4 shrink-0" />
+                    <span>
+                      Đã vào ca lúc {formatTimeVN(latestTodayLog.server_timestamp)}
+                    </span>
+                  </p>
+                ) : hasCompletedToday ? (
+                  <p className="mt-1 inline-flex items-center gap-1.5 text-sm font-bold text-amber-300 sm:text-base">
+                    <CheckCircle2 className="h-4 w-4 shrink-0" />
+                    <span>
+                      Đã ra ca lúc {formatTimeVN(latestTodayLog.server_timestamp)}
+                    </span>
+                  </p>
+                ) : (
+                  <p className="mt-1 inline-flex items-center gap-1.5 text-sm font-semibold text-slate-200 sm:text-base">
+                    <Clock className="h-4 w-4 shrink-0 text-slate-300" />
+                    <span>Chưa chấm vào ca</span>
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div className="space-y-4 p-4 sm:p-6">
+              {/* Two Big, Unmistakable Camera Action Buttons */}
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4">
                 <button
                   type="button"
                   onClick={() => startAttendanceFlow('check_in')}
@@ -644,10 +787,8 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
                       : 'border border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100'
                   }`}
                 >
-                  <LogIn className="h-6 w-6 shrink-0" />
-                  <span className="text-left leading-tight">
-                    CHẤM CÔNG VÀO CA (CHECK-IN)
-                  </span>
+                  <Camera className="h-6 w-6 shrink-0" />
+                  <span>MỞ CAMERA CHẤM VÀO CA</span>
                 </button>
 
                 <button
@@ -659,153 +800,147 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
                       : 'border border-slate-200 bg-slate-50 text-slate-700 hover:bg-slate-100'
                   }`}
                 >
-                  <LogOut className="h-6 w-6 shrink-0" />
-                  <span className="text-left leading-tight">
-                    CHẤM CÔNG RA CA (CHECK-OUT)
-                  </span>
+                  <Camera className="h-6 w-6 shrink-0" />
+                  <span>MỞ CAMERA CHẤM RA CA</span>
                 </button>
               </div>
 
-                <div className="mt-5 grid grid-cols-1 gap-3 border-t border-slate-100 pt-4 text-xs text-slate-600 sm:grid-cols-3">
-                  <div className="flex items-start gap-2">
-                    <MapPin className="mt-0.5 h-4 w-4 shrink-0 text-indigo-600" />
-                    <div>
-                      <p className="font-semibold text-slate-800">Bán kính cho phép</p>
-                      <p className="font-mono tabular-nums">
-                        ≤ {settings.geofence_radius_m}m từ điểm
-                      </p>
-                    </div>
-                  </div>
-                  <div className="flex items-start gap-2">
-                    <Navigation className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
-                    <div>
-                      <p className="font-semibold text-slate-800">Độ chính xác GPS</p>
-                      <p className="font-mono tabular-nums">
-                        Yêu cầu sai số ≤ {settings.max_gps_accuracy_m}m
-                      </p>
-                    </div>
-                  </div>
-                  <div className="flex items-start gap-2">
-                    <Camera className="mt-0.5 h-4 w-4 shrink-0 text-slate-700" />
-                    <div>
-                      <p className="font-semibold text-slate-800">Xác thực khuôn mặt</p>
-                      <p>Chụp trực tiếp · Chặn tải ảnh sẵn</p>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Today's logs quick timeline */}
-            <div className="rounded-2xl border border-slate-200 bg-white p-5">
-              <div className="flex items-center justify-between">
-                <h2 className="text-sm font-bold text-slate-900">
-                  Lượt chấm công hôm nay ({formatDateVN(now.toISOString())})
-                </h2>
-                <span className="font-mono text-xs text-slate-500 tabular-nums">
-                  {todayLogs.length} lượt
-                </span>
-              </div>
-
-              {todayLogs.length === 0 ? (
-                <p className="mt-4 text-sm text-slate-500">
-                  Bạn chưa ghi nhận lượt chấm công nào trong ngày hôm nay. Nhấn nút phía trên để bắt đầu ca làm việc.
-                </p>
-              ) : (
-                <div className="mt-3 divide-y divide-slate-100">
-                  {todayLogs.map((item) => (
-                    <button
-                      key={item.id}
-                      type="button"
-                      onClick={() => onInspectLog(item)}
-                      className="flex min-h-[56px] w-full items-center justify-between gap-3 py-3 text-left transition-colors hover:bg-slate-50"
-                    >
-                      <div className="min-w-0">
-                        <p className="text-sm font-semibold text-slate-900">
-                          {item.action === 'check_in' ? 'Vào ca (Check-in)' : 'Ra ca (Check-out)'}
-                          <span className="ml-2 font-mono text-xs font-normal text-slate-500 tabular-nums">
-                            {formatTimeVN(item.server_timestamp)}
-                          </span>
-                        </p>
-                        <p className="mt-0.5 truncate text-xs text-slate-500">
-                          {item.address_text} · Cách {Math.round(item.distance_to_office_m)}m
-                        </p>
-                      </div>
-                      <span
-                        className={`shrink-0 text-xs font-semibold ${
-                          item.geofence_status === 'valid'
-                            ? 'text-emerald-700'
-                            : item.geofence_status === 'out_of_range_noted'
-                              ? 'text-amber-700'
-                              : 'text-rose-700'
-                        }`}
-                      >
-                        Xem chứng cứ
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              )}
+              <p className="text-center text-xs text-slate-500">
+                Bấm nút phía trên để mở Camera chụp ảnh khuôn mặt trực tiếp và lưu giờ chấm công.
+              </p>
             </div>
           </div>
 
-          {/* Right Column: Monthly Snapshot & Office Location Info */}
-          <div className="space-y-5 lg:col-span-5">
-            <div className="rounded-2xl border border-slate-200 bg-white p-6">
-              <h2 className="text-sm font-bold text-slate-900">
-                Tổng hợp tháng này của bạn
+          {/* Today's Clear Check-In & Check-Out Pair Card */}
+          <div className="rounded-2xl border border-slate-200 bg-white p-4 sm:p-6">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-bold text-slate-900 sm:text-base">
+                Chấm vào / Chấm ra hôm nay ({formatDateVN(now.toISOString())})
               </h2>
-              <div className="mt-4 grid grid-cols-2 gap-4">
-                <div className="border-b border-slate-100 pb-3">
-                  <p className="text-xs text-slate-500">Số ngày công</p>
-                  <p className="mt-1 font-mono text-2xl font-bold text-slate-900 tabular-nums">
-                    {monthSummary?.totalShifts ?? 0}
-                  </p>
+              <button
+                type="button"
+                onClick={() => setActiveTab('history')}
+                className="text-xs font-semibold text-indigo-600 hover:underline"
+              >
+                Xem tất cả ngày
+              </button>
+            </div>
+
+            <div className="mt-3.5 grid grid-cols-1 gap-3 sm:grid-cols-2">
+              {/* Today Check-in Box */}
+              <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3.5">
+                <div className="flex items-center justify-between">
+                  <span className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-700">
+                    <LogIn className="h-4 w-4" />
+                    GIỜ VÀO CA
+                  </span>
+                  {todayCheckInLog && (
+                    <span
+                      className={`text-xs font-semibold ${
+                        formatSimpleLocationStatus(todayCheckInLog.geofence_status)
+                          .className
+                      }`}
+                    >
+                      {
+                        formatSimpleLocationStatus(todayCheckInLog.geofence_status)
+                          .label
+                      }
+                    </span>
+                  )}
                 </div>
-                <div className="border-b border-slate-100 pb-3">
-                  <p className="text-xs text-slate-500">Giờ làm thực tế</p>
-                  <p className="mt-1 font-mono text-2xl font-bold text-slate-900 tabular-nums">
-                    {monthSummary?.totalWorkHours ?? 0}h
-                  </p>
-                </div>
-                <div>
-                  <p className="text-xs text-slate-500">Tổng phút đi muộn</p>
-                  <p
-                    className={`mt-1 font-mono text-2xl font-bold tabular-nums ${
-                      (monthSummary?.lateMinutes ?? 0) > 0
-                        ? 'text-amber-700'
-                        : 'text-emerald-700'
-                    }`}
+
+                {todayCheckInLog ? (
+                  <button
+                    type="button"
+                    onClick={() => onInspectLog(todayCheckInLog)}
+                    className="mt-2.5 flex w-full items-center gap-3 text-left"
                   >
-                    {monthSummary?.lateMinutes ?? 0}p
-                  </p>
+                    <img
+                      src={todayCheckInLog.photo_url}
+                      alt="Ảnh vào ca hôm nay"
+                      referrerPolicy="no-referrer"
+                      className="h-14 w-16 shrink-0 rounded-lg border border-slate-200 object-cover"
+                    />
+                    <div className="min-w-0 flex-1">
+                      <p className="font-mono text-xl font-bold text-slate-900 tabular-nums">
+                        {formatTimeVN(todayCheckInLog.server_timestamp)}
+                      </p>
+                      <p className="truncate text-xs text-slate-500">
+                        {todayCheckInLog.address_text}
+                      </p>
+                      <span className="text-[11px] font-semibold text-indigo-600">
+                        Chạm để xem ảnh lớn
+                      </span>
+                    </div>
+                  </button>
+                ) : (
+                  <p className="mt-3 text-sm text-slate-400">Chưa chấm vào ca</p>
+                )}
+              </div>
+
+              {/* Today Check-out Box */}
+              <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3.5">
+                <div className="flex items-center justify-between">
+                  <span className="inline-flex items-center gap-1.5 text-xs font-bold text-indigo-700">
+                    <LogOut className="h-4 w-4" />
+                    GIỜ RA CA
+                  </span>
+                  {todayCheckOutLog && (
+                    <span
+                      className={`text-xs font-semibold ${
+                        formatSimpleLocationStatus(todayCheckOutLog.geofence_status)
+                          .className
+                      }`}
+                    >
+                      {
+                        formatSimpleLocationStatus(todayCheckOutLog.geofence_status)
+                          .label
+                      }
+                    </span>
+                  )}
                 </div>
-                <div>
-                  <p className="text-xs text-slate-500">Thu nhập tạm tính</p>
-                  <p className="mt-1 font-mono text-xl font-bold text-indigo-700 tabular-nums">
-                    {formatVnd(monthSummary?.laborCostVnd ?? 0)}
-                  </p>
-                </div>
+
+                {todayCheckOutLog ? (
+                  <button
+                    type="button"
+                    onClick={() => onInspectLog(todayCheckOutLog)}
+                    className="mt-2.5 flex w-full items-center gap-3 text-left"
+                  >
+                    <img
+                      src={todayCheckOutLog.photo_url}
+                      alt="Ảnh ra ca hôm nay"
+                      referrerPolicy="no-referrer"
+                      className="h-14 w-16 shrink-0 rounded-lg border border-slate-200 object-cover"
+                    />
+                    <div className="min-w-0 flex-1">
+                      <p className="font-mono text-xl font-bold text-slate-900 tabular-nums">
+                        {formatTimeVN(todayCheckOutLog.server_timestamp)}
+                      </p>
+                      <p className="truncate text-xs text-slate-500">
+                        {todayCheckOutLog.address_text}
+                      </p>
+                      <span className="text-[11px] font-semibold text-indigo-600">
+                        Chạm để xem ảnh lớn
+                      </span>
+                    </div>
+                  </button>
+                ) : (
+                  <p className="mt-3 text-sm text-slate-400">Chưa chấm ra ca</p>
+                )}
               </div>
             </div>
 
-            <div className="rounded-2xl border border-slate-200 bg-white p-6">
-              <h2 className="text-sm font-bold text-slate-900">
-                Địa điểm văn phòng cấu hình
-              </h2>
-              <p className="mt-2 text-sm text-slate-700">{settings.company_name}</p>
-              <p className="mt-1 text-xs leading-relaxed text-slate-500">
-                {settings.office_address}
-              </p>
-              <p className="mt-3 font-mono text-xs text-slate-600 tabular-nums">
-                Tọa độ: {settings.latitude.toFixed(6)}, {settings.longitude.toFixed(6)}
-              </p>
+            <div className="mt-3.5 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-3 text-xs text-slate-500">
+              <span>Điểm làm việc: {settings.office_address}</span>
+              <span className="font-mono font-semibold text-slate-700 tabular-nums">
+                Tháng này: {monthSummary?.totalShifts ?? 0} ngày ({monthSummary?.totalWorkHours ?? 0} giờ)
+              </span>
             </div>
           </div>
         </div>
       )}
 
-      {/* TAB 2: HISTORY & DATA EXTRACTION */}
+      {/* TAB 2: SIMPLE & CLEAR DAILY CHECK-IN / CHECK-OUT HISTORY + EXTRACTION */}
       {activeTab === 'history' && (
         <div className="space-y-4 sm:space-y-5">
           {/* Quick Lookup by Exact Full Name */}
@@ -821,9 +956,9 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
             >
               <label
                 htmlFor="history-name-lookup"
-                className="block text-xs font-bold tracking-wide text-slate-700 uppercase"
+                className="block text-sm font-bold text-slate-800"
               >
-                Tra cứu & trích xuất dữ liệu điểm danh theo Họ và tên
+                Xem dữ liệu chấm công theo Họ và tên
               </label>
               <div className="mt-2.5 flex flex-col gap-2.5 sm:flex-row">
                 <div className="relative flex-1">
@@ -833,46 +968,46 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
                     type="text"
                     value={lookupInput}
                     onChange={(e) => setLookupInput(e.target.value)}
-                    placeholder="Nhập đúng Họ và tên cần xem dữ liệu..."
-                    className="min-h-[46px] w-full rounded-xl border border-slate-300 bg-white py-2.5 pr-4 pl-10 text-base text-slate-900 focus:border-indigo-600 focus:ring-2 focus:ring-indigo-600/20 focus:outline-none sm:text-sm"
+                    placeholder="Nhập đúng Họ và tên cần xem..."
+                    className="min-h-[48px] w-full rounded-xl border border-slate-300 bg-white py-2.5 pr-4 pl-10 text-base text-slate-900 focus:border-indigo-600 focus:ring-2 focus:ring-indigo-600/20 focus:outline-none sm:text-sm"
                   />
                 </div>
                 <button
                   type="submit"
-                  className="inline-flex min-h-[46px] shrink-0 items-center justify-center gap-2 rounded-xl bg-[#0B1E36] px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-[#132C4E]"
+                  className="inline-flex min-h-[48px] shrink-0 items-center justify-center gap-2 rounded-xl bg-[#0B1E36] px-5 py-2.5 text-sm font-bold text-white transition-colors hover:bg-[#132C4E]"
                 >
                   <Search className="h-4 w-4" />
-                  <span>Tra cứu họ tên này</span>
+                  <span>Xem dữ liệu</span>
                 </button>
               </div>
             </form>
           )}
 
-          {/* Current Shift Status & Quick Check-in / Check-out */}
+          {/* Current Shift Status & 1-Tap Camera Button */}
           <div className="flex flex-col justify-between gap-3 rounded-2xl border border-slate-200 bg-white p-4 sm:flex-row sm:items-center sm:p-5">
             <div>
-              <p className="text-xs font-medium text-slate-500">
-                Trạng thái ca hôm nay ({formatDateVN(now.toISOString())}) ·{' '}
-                <span className="font-semibold text-slate-800">{employee.full_name}</span>
+              <p className="text-xs text-slate-500">
+                Nhân sự:{' '}
+                <span className="font-bold text-slate-900">{employee.full_name}</span>
               </p>
               {isCurrentlyInShift ? (
                 <p className="mt-1 inline-flex items-center gap-1.5 text-sm font-bold text-emerald-700">
                   <CheckCircle2 className="h-4 w-4" />
                   <span>
-                    Đang trong ca từ {formatTimeVN(latestTodayLog.server_timestamp)}
+                    Hôm nay đang trong ca (Vào lúc {formatTimeVN(latestTodayLog.server_timestamp)})
                   </span>
                 </p>
               ) : hasCompletedToday ? (
                 <p className="mt-1 inline-flex items-center gap-1.5 text-sm font-bold text-indigo-700">
-                  <ShieldCheck className="h-4 w-4" />
+                  <CheckCircle2 className="h-4 w-4" />
                   <span>
-                    Đã hoàn thành ca (Ra ca lúc {formatTimeVN(latestTodayLog.server_timestamp)})
+                    Hôm nay đã xong ca (Ra lúc {formatTimeVN(latestTodayLog.server_timestamp)})
                   </span>
                 </p>
               ) : (
                 <p className="mt-1 inline-flex items-center gap-1.5 text-sm font-semibold text-slate-700">
                   <Clock className="h-4 w-4 text-slate-400" />
-                  <span>Chưa ghi nhận lượt vào ca hôm nay</span>
+                  <span>Hôm nay chưa chấm vào ca</span>
                 </p>
               )}
             </div>
@@ -882,361 +1017,342 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
                 <button
                   type="button"
                   onClick={() => startAttendanceFlow('check_in')}
-                  className="inline-flex min-h-[44px] flex-1 items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 py-2 text-xs font-bold text-white hover:bg-emerald-700 sm:flex-initial sm:text-sm"
+                  className="inline-flex min-h-[46px] flex-1 items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-bold text-white hover:bg-emerald-700 sm:flex-initial"
                 >
-                  <LogIn className="h-4 w-4" />
-                  <span>Vào ca ngay</span>
+                  <Camera className="h-4 w-4" />
+                  <span>Chụp chấm VÀO CA</span>
                 </button>
               ) : (
                 <button
                   type="button"
                   onClick={() => startAttendanceFlow('check_out')}
-                  className="inline-flex min-h-[44px] flex-1 items-center justify-center gap-2 rounded-xl bg-indigo-600 px-4 py-2 text-xs font-bold text-white hover:bg-indigo-700 sm:flex-initial sm:text-sm"
+                  className="inline-flex min-h-[46px] flex-1 items-center justify-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-bold text-white hover:bg-indigo-700 sm:flex-initial"
                 >
-                  <LogOut className="h-4 w-4" />
-                  <span>Ra ca ngay</span>
+                  <Camera className="h-4 w-4" />
+                  <span>Chụp chấm RA CA</span>
                 </button>
               )}
             </div>
           </div>
 
-          {/* Filter, Summary Metrics & Extraction Toolbar */}
-          <div className="rounded-2xl border border-slate-200 bg-white">
-            <div className="space-y-4 border-b border-slate-200 p-4 sm:p-6">
-              <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
-                <div>
-                  <h2 className="text-base font-bold text-slate-900">
-                    Toàn bộ dữ liệu điểm danh: {employee.full_name}
-                  </h2>
-                  <p className="mt-0.5 text-xs text-slate-500">
-                    Hiển thị đầy đủ giờ máy chủ UTC+7, giờ thiết bị, tọa độ GPS, địa chỉ, ảnh xác thực & mã băm SHA-256
-                  </p>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={filteredMyLogs.length === 0}
-                    onClick={async () => {
-                      const periodLabel =
-                        historyRange === 'all'
-                          ? 'Tat_Ca'
-                          : `${historyBounds.startDateKey}_${historyBounds.endDateKey}`;
-                      const lines = [
-                        `TRÍCH XUẤT LỊCH SỬ ĐIỂM DANH - ${employee.full_name.toUpperCase()} (${employee.employee_code})`,
-                        `Tổng lượt: ${filteredMyLogs.length} | Số ca: ${historySummary?.totalShifts ?? 0} | Tổng giờ: ${historySummary?.totalWorkHours ?? 0}h`,
-                        '----------------------------------------',
-                        ...filteredMyLogs.map((l) => {
-                          const actionTxt = l.action === 'check_in' ? 'VÀO CA' : 'RA CA';
-                          const statusTxt =
-                            l.geofence_status === 'valid'
-                              ? 'Hợp lệ'
-                              : l.geofence_status === 'out_of_range_noted'
-                                ? 'Ngoài vùng (Có ghi chú)'
-                                : 'Vi phạm';
-                          return `[${actionTxt}] ${formatDateTimeVN(l.server_timestamp)} (UTC+7)\n  • Mã: ${l.id} | GPS: ${l.latitude.toFixed(6)}, ${l.longitude.toFixed(6)} (±${Math.round(l.gps_accuracy_m)}m, cách ${Math.round(l.distance_to_office_m)}m)\n  • Trạng thái: ${statusTxt}\n  • Địa chỉ: ${l.address_text}${l.note ? `\n  • Ghi chú: ${l.note}` : ''}`;
-                        }),
-                      ].join('\n');
-                      try {
-                        await navigator.clipboard.writeText(lines);
-                        setCopiedSummary(true);
-                        window.setTimeout(() => setCopiedSummary(false), 2500);
-                      } catch {
-                        // Ignore clipboard errors
-                      }
-                    }}
-                    className="inline-flex min-h-[42px] items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-                  >
-                    {copiedSummary ? (
-                      <>
-                        <Check className="h-4 w-4 text-emerald-600" />
-                        <span className="text-emerald-700">Đã sao chép</span>
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="h-4 w-4" />
-                        <span>Sao chép tóm tắt</span>
-                      </>
-                    )}
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const periodLabel =
-                        historyRange === 'all'
-                          ? 'Tat_Ca'
-                          : `${historyBounds.startDateKey}_den_${historyBounds.endDateKey}`;
-                      exportPersonalAttendanceExcel({
-                        employeeName: employee.full_name,
-                        employeeCode: employee.employee_code,
-                        department: employee.department,
-                        summaryRow: historySummary,
-                        logs: filteredMyLogs,
-                        periodLabel,
-                      });
-                    }}
-                    className="inline-flex min-h-[42px] items-center gap-1.5 rounded-xl bg-emerald-600 px-4 py-2 text-xs font-bold text-white transition-colors hover:bg-emerald-700"
-                  >
-                    <Download className="h-4 w-4" />
-                    <span>Trích xuất Excel (.xlsx)</span>
-                  </button>
-                </div>
+          {/* Filter, Totals & Excel Export */}
+          <div className="rounded-2xl border border-slate-200 bg-white p-4 sm:p-6">
+            <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
+              <div>
+                <h2 className="text-base font-bold text-slate-900">
+                  Lịch sử Chấm vào — Chấm ra của {employee.full_name}
+                </h2>
+                <p className="mt-0.5 text-xs text-slate-500">
+                  Hiển thị gọn gàng theo từng ngày làm việc. Chạm vào ảnh để xem chi tiết.
+                </p>
               </div>
 
-              {/* Date Range Selector */}
               <div className="flex flex-wrap items-center gap-2">
-                {(
-                  [
-                    { key: 'all', label: 'Tất cả thời gian' },
-                    { key: 'today', label: 'Hôm nay' },
-                    { key: 'week', label: 'Tuần này' },
-                    { key: 'month', label: 'Tháng này' },
-                    { key: 'custom', label: 'Tùy chọn ngày' },
-                  ] as const
-                ).map((item) => (
-                  <button
-                    key={item.key}
-                    type="button"
-                    onClick={() => setHistoryRange(item.key)}
-                    className={`min-h-[38px] rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors ${
-                      historyRange === item.key
-                        ? 'border-indigo-600 bg-indigo-50 text-indigo-700'
-                        : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
-                    }`}
-                  >
-                    {item.label}
-                  </button>
-                ))}
-              </div>
+                <button
+                  type="button"
+                  disabled={filteredMyLogs.length === 0}
+                  onClick={async () => {
+                    const lines = [
+                      `BẢNG CHẤM CÔNG - ${employee.full_name.toUpperCase()}`,
+                      `Số ngày công: ${historySummary?.totalShifts ?? 0} | Tổng giờ: ${historySummary?.totalWorkHours ?? 0} giờ`,
+                      '----------------------------------------',
+                      ...dailyShiftCards.map((card) => {
+                        const inTxt = card.checkIn
+                          ? `Vào: ${formatTimeVN(card.checkIn.server_timestamp)}`
+                          : 'Vào: Chưa chấm';
+                        const outTxt = card.checkOut
+                          ? `Ra: ${formatTimeVN(card.checkOut.server_timestamp)}`
+                          : 'Ra: Chưa chấm';
+                        return `${card.dateLabel}\n  • ${inTxt} | ${outTxt} (${card.durationLabel})`;
+                      }),
+                    ].join('\n');
+                    try {
+                      await navigator.clipboard.writeText(lines);
+                      setCopiedSummary(true);
+                      window.setTimeout(() => setCopiedSummary(false), 2500);
+                    } catch {
+                      // Ignore clipboard errors
+                    }
+                  }}
+                  className="inline-flex min-h-[42px] items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                >
+                  {copiedSummary ? (
+                    <>
+                      <Check className="h-4 w-4 text-emerald-600" />
+                      <span className="text-emerald-700">Đã sao chép</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="h-4 w-4" />
+                      <span>Sao chép</span>
+                    </>
+                  )}
+                </button>
 
-              {historyRange === 'custom' && (
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  <div>
-                    <label
-                      htmlFor="history-custom-start"
-                      className="block text-xs font-medium text-slate-600"
-                    >
-                      Từ ngày
-                    </label>
-                    <input
-                      id="history-custom-start"
-                      type="date"
-                      value={customStart}
-                      onChange={(e) => setCustomStart(e.target.value)}
-                      className="mt-1 min-h-[42px] w-full rounded-xl border border-slate-300 px-3 py-2 text-sm text-slate-900"
-                    />
-                  </div>
-                  <div>
-                    <label
-                      htmlFor="history-custom-end"
-                      className="block text-xs font-medium text-slate-600"
-                    >
-                      Đến ngày
-                    </label>
-                    <input
-                      id="history-custom-end"
-                      type="date"
-                      value={customEnd}
-                      onChange={(e) => setCustomEnd(e.target.value)}
-                      className="mt-1 min-h-[42px] w-full rounded-xl border border-slate-300 px-3 py-2 text-sm text-slate-900"
-                    />
-                  </div>
-                </div>
-              )}
-
-              {/* Summary Strip */}
-              <div className="grid grid-cols-2 gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3.5 sm:grid-cols-4">
-                <div>
-                  <p className="text-[11px] text-slate-500">Tổng lượt điểm danh</p>
-                  <p className="mt-0.5 font-mono text-lg font-bold text-slate-900 tabular-nums">
-                    {filteredMyLogs.length} lượt
-                  </p>
-                </div>
-                <div>
-                  <p className="text-[11px] text-slate-500">Số ca đã vào</p>
-                  <p className="mt-0.5 font-mono text-lg font-bold text-slate-900 tabular-nums">
-                    {historySummary?.totalShifts ?? 0} ca
-                  </p>
-                </div>
-                <div>
-                  <p className="text-[11px] text-slate-500">Tổng giờ làm</p>
-                  <p className="mt-0.5 font-mono text-lg font-bold text-indigo-700 tabular-nums">
-                    {historySummary?.totalWorkHours ?? 0} giờ
-                  </p>
-                </div>
-                <div>
-                  <p className="text-[11px] text-slate-500">Đi muộn / Tăng ca</p>
-                  <p className="mt-0.5 font-mono text-sm font-bold text-slate-800 tabular-nums">
-                    {historySummary?.lateMinutes ?? 0}p · OT {historySummary?.overtimeHours ?? 0}h
-                  </p>
-                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const periodLabel =
+                      historyRange === 'all'
+                        ? 'Tat_Ca'
+                        : `${historyBounds.startDateKey}_den_${historyBounds.endDateKey}`;
+                    exportPersonalAttendanceExcel({
+                      employeeName: employee.full_name,
+                      employeeCode: employee.employee_code,
+                      department: employee.department,
+                      summaryRow: historySummary,
+                      logs: filteredMyLogs,
+                      periodLabel,
+                    });
+                  }}
+                  className="inline-flex min-h-[42px] items-center gap-1.5 rounded-xl bg-emerald-600 px-4 py-2 text-xs font-bold text-white transition-colors hover:bg-emerald-700"
+                >
+                  <Download className="h-4 w-4" />
+                  <span>Tải file Excel</span>
+                </button>
               </div>
             </div>
 
-            {filteredMyLogs.length === 0 ? (
-              <div className="p-8 text-center">
-                <p className="text-sm font-semibold text-slate-800">
-                  Không tìm thấy dữ liệu điểm danh cho &ldquo;{employee.full_name}&rdquo;
-                </p>
-                <p className="mt-1 text-xs text-slate-500">
-                  Vui lòng kiểm tra lại đúng chính tả Họ và tên có dấu hoặc chọn lại khoảng thời gian lọc.
-                </p>
-              </div>
-            ) : (
-              <div className="divide-y divide-slate-200">
-                {filteredMyLogs.map((item) => {
-                  const mapsUrl = `https://www.google.com/maps?q=${item.latitude},${item.longitude}`;
-                  return (
-                    <div
-                      key={item.id}
-                      className="flex flex-col gap-4 p-4 transition-colors hover:bg-slate-50/70 sm:flex-row sm:items-start sm:p-5"
-                    >
-                      {/* Thumbnail photo */}
-                      <button
-                        type="button"
-                        onClick={() => onInspectLog(item)}
-                        className="group relative h-28 w-full shrink-0 overflow-hidden rounded-xl border border-slate-200 bg-slate-900 sm:h-28 sm:w-36"
-                        title="Xem ảnh chứng cứ phóng lớn"
-                      >
-                        <img
-                          src={item.photo_url}
-                          alt={`Ảnh ${item.action === 'check_in' ? 'vào ca' : 'ra ca'} của ${item.employee_name}`}
-                          referrerPolicy="no-referrer"
-                          className="h-full w-full object-cover transition-transform group-hover:scale-105"
-                        />
-                        <span className="absolute right-1.5 bottom-1.5 rounded bg-slate-950/80 px-1.5 py-0.5 text-[10px] font-semibold text-white">
-                          Phóng to
-                        </span>
-                      </button>
+            {/* Date Filter Buttons */}
+            <div className="mt-4 flex flex-wrap items-center gap-2">
+              {(
+                [
+                  { key: 'all', label: 'Tất cả' },
+                  { key: 'today', label: 'Hôm nay' },
+                  { key: 'week', label: 'Tuần này' },
+                  { key: 'month', label: 'Tháng này' },
+                  { key: 'custom', label: 'Chọn ngày' },
+                ] as const
+              ).map((item) => (
+                <button
+                  key={item.key}
+                  type="button"
+                  onClick={() => setHistoryRange(item.key)}
+                  className={`min-h-[38px] rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors ${
+                    historyRange === item.key
+                      ? 'border-indigo-600 bg-indigo-50 text-indigo-700'
+                      : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                  }`}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </div>
 
-                      {/* Full Forensic Details */}
-                      <div className="min-w-0 flex-1 space-y-2">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span
-                              className={`text-sm font-bold ${
-                                item.action === 'check_in'
-                                  ? 'text-emerald-700'
-                                  : 'text-indigo-700'
-                              }`}
-                            >
-                              {item.action === 'check_in'
-                                ? 'VÀO CA (CHECK-IN)'
-                                : 'RA CA (CHECK-OUT)'}
-                            </span>
-                            <span aria-hidden="true" className="text-slate-300">
-                              ·
-                            </span>
-                            <span className="font-mono text-sm font-bold text-slate-900 tabular-nums">
-                              {formatDateTimeVN(item.server_timestamp)}
-                            </span>
-                            <span className="font-mono text-[11px] text-slate-400">
-                              #{item.id}
-                            </span>
-                          </div>
-
-                          <span
-                            className={`text-xs font-bold ${
-                              item.geofence_status === 'valid'
-                                ? 'text-emerald-700'
-                                : item.geofence_status === 'out_of_range_noted'
-                                  ? 'text-amber-700'
-                                  : 'text-rose-700'
-                            }`}
-                          >
-                            {item.geofence_status === 'valid'
-                              ? 'Hợp lệ trong vùng'
-                              : item.geofence_status === 'out_of_range_noted'
-                                ? 'Ngoài vùng (Có ghi chú)'
-                                : 'Cảnh báo vi phạm vùng'}
-                          </span>
-                        </div>
-
-                        <div className="grid grid-cols-1 gap-1.5 text-xs text-slate-600 sm:grid-cols-2">
-                          <p>
-                            <span className="text-slate-400">Người điểm danh:</span>{' '}
-                            <span className="font-semibold text-slate-800">
-                              {item.employee_name}
-                            </span>{' '}
-                            ({item.employee_code})
-                          </p>
-                          <p className="font-mono tabular-nums">
-                            <span className="font-sans text-slate-400">Giờ thiết bị:</span>{' '}
-                            {formatDateTimeVN(item.device_timestamp)} ·{' '}
-                            <span
-                              className={
-                                item.clock_tamper_flag
-                                  ? 'font-semibold text-rose-700'
-                                  : 'text-emerald-700'
-                              }
-                            >
-                              Lệch {item.clock_drift_seconds}s
-                            </span>
-                          </p>
-                          <p className="sm:col-span-2">
-                            <span className="text-slate-400">Địa chỉ GPS:</span>{' '}
-                            <span className="text-slate-800">{item.address_text}</span>
-                          </p>
-                          <p className="flex flex-wrap items-center gap-2 font-mono tabular-nums sm:col-span-2">
-                            <span className="font-sans text-slate-400">Tọa độ:</span>
-                            <a
-                              href={mapsUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="inline-flex items-center gap-1 font-semibold text-indigo-600 hover:underline"
-                            >
-                              <span>
-                                {item.latitude.toFixed(6)}, {item.longitude.toFixed(6)}
-                              </span>
-                              <ExternalLink className="h-3 w-3" />
-                            </a>
-                            <span className="text-slate-400">·</span>
-                            <span>
-                              Khoảng cách {Math.round(item.distance_to_office_m)}m (Sai số ±
-                              {Math.round(item.gps_accuracy_m)}m)
-                            </span>
-                          </p>
-                          {item.note && (
-                            <p className="rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-1.5 text-amber-900 sm:col-span-2">
-                              <span className="font-semibold">Ghi chú: </span>
-                              {item.note}
-                            </p>
-                          )}
-                          {item.is_adjusted && (
-                            <p className="text-amber-700 sm:col-span-2">
-                              Đã được điều chỉnh bởi Quản trị viên: {item.adjusted_by}
-                            </p>
-                          )}
-                        </div>
-
-                        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-2">
-                          <span className="font-mono text-[11px] text-slate-400">
-                            SHA-256: {item.integrity_hash.slice(0, 20)}...
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => onInspectLog(item)}
-                            className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-indigo-700 hover:bg-indigo-50"
-                          >
-                            <ShieldCheck className="h-3.5 w-3.5" />
-                            <span>Mở trình kiểm tra chứng cứ</span>
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
+            {historyRange === 'custom' && (
+              <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div>
+                  <label
+                    htmlFor="history-custom-start"
+                    className="block text-xs font-medium text-slate-600"
+                  >
+                    Từ ngày
+                  </label>
+                  <input
+                    id="history-custom-start"
+                    type="date"
+                    value={customStart}
+                    onChange={(e) => setCustomStart(e.target.value)}
+                    className="mt-1 min-h-[42px] w-full rounded-xl border border-slate-300 px-3 py-2 text-sm text-slate-900"
+                  />
+                </div>
+                <div>
+                  <label
+                    htmlFor="history-custom-end"
+                    className="block text-xs font-medium text-slate-600"
+                  >
+                    Đến ngày
+                  </label>
+                  <input
+                    id="history-custom-end"
+                    type="date"
+                    value={customEnd}
+                    onChange={(e) => setCustomEnd(e.target.value)}
+                    className="mt-1 min-h-[42px] w-full rounded-xl border border-slate-300 px-3 py-2 text-sm text-slate-900"
+                  />
+                </div>
               </div>
             )}
+
+            {/* Simple 3-Number Summary */}
+            <div className="mt-4 grid grid-cols-3 gap-2.5 rounded-xl border border-slate-200 bg-slate-50 p-3 sm:gap-4 sm:p-4">
+              <div>
+                <p className="text-[11px] text-slate-500 sm:text-xs">Số ngày công</p>
+                <p className="mt-0.5 font-mono text-base font-bold text-slate-900 tabular-nums sm:text-xl">
+                  {historySummary?.totalShifts ?? 0} ca
+                </p>
+              </div>
+              <div>
+                <p className="text-[11px] text-slate-500 sm:text-xs">Tổng giờ làm</p>
+                <p className="mt-0.5 font-mono text-base font-bold text-indigo-700 tabular-nums sm:text-xl">
+                  {historySummary?.totalWorkHours ?? 0} giờ
+                </p>
+              </div>
+              <div>
+                <p className="text-[11px] text-slate-500 sm:text-xs">Tổng lượt bấm</p>
+                <p className="mt-0.5 font-mono text-base font-bold text-slate-900 tabular-nums sm:text-xl">
+                  {filteredMyLogs.length} lượt
+                </p>
+              </div>
+            </div>
           </div>
+
+          {/* Daily Check-in / Check-out Cards */}
+          {dailyShiftCards.length === 0 ? (
+            <div className="rounded-2xl border border-slate-200 bg-white p-8 text-center">
+              <p className="text-sm font-semibold text-slate-800">
+                Chưa có dữ liệu chấm công cho &ldquo;{employee.full_name}&rdquo;
+              </p>
+              <p className="mt-1 text-xs text-slate-500">
+                Kiểm tra lại đúng Họ và tên có dấu, hoặc bấm nút Chụp chấm VÀO CA phía trên để bắt đầu.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {dailyShiftCards.map((card) => (
+                <div
+                  key={card.id}
+                  className="overflow-hidden rounded-2xl border border-slate-200 bg-white"
+                >
+                  {/* Card Header: Date & Hours */}
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 bg-slate-50 px-4 py-2.5 sm:px-5">
+                    <span className="text-xs font-bold text-slate-900 capitalize sm:text-sm">
+                      {card.dateLabel}
+                    </span>
+                    <span className="font-mono text-xs font-bold text-indigo-700 tabular-nums">
+                      {card.durationLabel}
+                    </span>
+                  </div>
+
+                  {/* Two Simple Columns: VÀO CA & RA CA */}
+                  <div className="grid grid-cols-1 divide-y divide-slate-100 sm:grid-cols-2 sm:divide-x sm:divide-y-0">
+                    {/* VÀO CA */}
+                    <div className="p-3.5 sm:p-4">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-emerald-700">
+                          VÀO CA
+                        </span>
+                        {card.checkIn && (
+                          <span
+                            className={`text-[11px] font-semibold ${
+                              formatSimpleLocationStatus(card.checkIn.geofence_status)
+                                .className
+                            }`}
+                          >
+                            {
+                              formatSimpleLocationStatus(card.checkIn.geofence_status)
+                                .label
+                            }
+                          </span>
+                        )}
+                      </div>
+
+                      {card.checkIn ? (
+                        <button
+                          type="button"
+                          onClick={() => onInspectLog(card.checkIn!)}
+                          className="mt-2 flex w-full items-center gap-3 rounded-xl p-1 text-left transition-colors hover:bg-slate-50"
+                        >
+                          <img
+                            src={card.checkIn.photo_url}
+                            alt={`Ảnh vào ca ${card.dateLabel}`}
+                            referrerPolicy="no-referrer"
+                            className="h-16 w-20 shrink-0 rounded-lg border border-slate-200 object-cover"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <p className="font-mono text-lg font-bold text-slate-900 tabular-nums">
+                              {formatTimeVN(card.checkIn.server_timestamp)}
+                            </p>
+                            <p className="truncate text-xs text-slate-500">
+                              {card.checkIn.address_text}
+                            </p>
+                            {card.checkIn.note && (
+                              <p className="mt-0.5 truncate text-[11px] text-amber-700">
+                                Lý do: {card.checkIn.note}
+                              </p>
+                            )}
+                            <span className="mt-0.5 inline-block text-[11px] font-semibold text-indigo-600">
+                              Xem ảnh & chi tiết
+                            </span>
+                          </div>
+                        </button>
+                      ) : (
+                        <p className="mt-3 text-xs text-slate-400">
+                          Không có lượt vào ca
+                        </p>
+                      )}
+                    </div>
+
+                    {/* RA CA */}
+                    <div className="p-3.5 sm:p-4">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-indigo-700">
+                          RA CA
+                        </span>
+                        {card.checkOut && (
+                          <span
+                            className={`text-[11px] font-semibold ${
+                              formatSimpleLocationStatus(
+                                card.checkOut.geofence_status
+                              ).className
+                            }`}
+                          >
+                            {
+                              formatSimpleLocationStatus(
+                                card.checkOut.geofence_status
+                              ).label
+                            }
+                          </span>
+                        )}
+                      </div>
+
+                      {card.checkOut ? (
+                        <button
+                          type="button"
+                          onClick={() => onInspectLog(card.checkOut!)}
+                          className="mt-2 flex w-full items-center gap-3 rounded-xl p-1 text-left transition-colors hover:bg-slate-50"
+                        >
+                          <img
+                            src={card.checkOut.photo_url}
+                            alt={`Ảnh ra ca ${card.dateLabel}`}
+                            referrerPolicy="no-referrer"
+                            className="h-16 w-20 shrink-0 rounded-lg border border-slate-200 object-cover"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <p className="font-mono text-lg font-bold text-slate-900 tabular-nums">
+                              {formatTimeVN(card.checkOut.server_timestamp)}
+                            </p>
+                            <p className="truncate text-xs text-slate-500">
+                              {card.checkOut.address_text}
+                            </p>
+                            {card.checkOut.note && (
+                              <p className="mt-0.5 truncate text-[11px] text-amber-700">
+                                Lý do: {card.checkOut.note}
+                              </p>
+                            )}
+                            <span className="mt-0.5 inline-block text-[11px] font-semibold text-indigo-600">
+                              Xem ảnh & chi tiết
+                            </span>
+                          </div>
+                        </button>
+                      ) : (
+                        <p className="mt-3 text-xs text-slate-400">
+                          Chưa chấm ra ca
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
-      {/* TAB 3: PROFILE & ESTIMATED PAY */}
+      {/* TAB 3: SIMPLE WORKER PROFILE */}
       {activeTab === 'profile' && (
-        <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
-          <div className="rounded-2xl border border-slate-200 bg-white p-6">
+        <div className="grid grid-cols-1 gap-4 sm:gap-6 md:grid-cols-2">
+          <div className="rounded-2xl border border-slate-200 bg-white p-5 sm:p-6">
             <h2 className="text-base font-bold text-slate-900">
               Thông tin nhân sự
             </h2>
@@ -1246,40 +1362,33 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
                 <dd className="font-semibold text-slate-900">{employee.full_name}</dd>
               </div>
               <div className="flex justify-between border-b border-slate-100 pb-2">
-                <dt className="text-slate-500">Mã nhân viên</dt>
+                <dt className="text-slate-500">Mã nhân sự</dt>
                 <dd className="font-mono font-semibold text-slate-900">
                   {employee.employee_code}
                 </dd>
               </div>
               <div className="flex justify-between border-b border-slate-100 pb-2">
-                <dt className="text-slate-500">Phòng ban / Chức vụ</dt>
+                <dt className="text-slate-500">Bộ phận</dt>
                 <dd className="font-medium text-slate-900">
-                  {employee.department} · {employee.position}
-                </dd>
-              </div>
-              <div className="flex justify-between border-b border-slate-100 pb-2">
-                <dt className="text-slate-500">Hình thức tính lương</dt>
-                <dd className="font-medium text-slate-900">
-                  {employee.pay_type === 'hourly' ? 'Theo giờ thực tế' : 'Theo ngày công'}
+                  {employee.department}
                 </dd>
               </div>
               <div className="flex justify-between">
-                <dt className="text-slate-500">Đơn giá cơ bản</dt>
-                <dd className="font-mono font-bold text-indigo-700 tabular-nums">
-                  {formatVnd(employee.base_rate_vnd)} /{' '}
-                  {employee.pay_type === 'hourly' ? 'giờ' : 'ngày'}
+                <dt className="text-slate-500">Địa điểm làm việc</dt>
+                <dd className="max-w-[60%] text-right font-medium text-slate-900">
+                  {settings.office_address}
                 </dd>
               </div>
             </dl>
           </div>
 
-          <div className="rounded-2xl border border-slate-200 bg-white p-6">
+          <div className="rounded-2xl border border-slate-200 bg-white p-5 sm:p-6">
             <h2 className="text-base font-bold text-slate-900">
-              Thống kê công tháng hiện tại
+              Tổng kết tháng này
             </h2>
             <dl className="mt-4 space-y-3 text-sm">
               <div className="flex justify-between border-b border-slate-100 pb-2">
-                <dt className="text-slate-500">Tổng số ca đã chấm</dt>
+                <dt className="text-slate-500">Số ngày đã đi làm</dt>
                 <dd className="font-mono font-semibold text-slate-900 tabular-nums">
                   {monthSummary?.totalShifts ?? 0} ca
                 </dd>
@@ -1290,20 +1399,8 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
                   {monthSummary?.totalWorkHours ?? 0} giờ
                 </dd>
               </div>
-              <div className="flex justify-between border-b border-slate-100 pb-2">
-                <dt className="text-slate-500">Giờ tăng ca (OT x{employee.ot_multiplier})</dt>
-                <dd className="font-mono font-semibold text-emerald-700 tabular-nums">
-                  {monthSummary?.overtimeHours ?? 0} giờ
-                </dd>
-              </div>
-              <div className="flex justify-between border-b border-slate-100 pb-2">
-                <dt className="text-slate-500">Số phút đi muộn</dt>
-                <dd className="font-mono font-semibold text-amber-700 tabular-nums">
-                  {monthSummary?.lateMinutes ?? 0} phút
-                </dd>
-              </div>
               <div className="flex justify-between pt-1">
-                <dt className="font-semibold text-slate-900">Tổng thu nhập tạm tính</dt>
+                <dt className="font-semibold text-slate-900">Thu nhập tạm tính</dt>
                 <dd className="font-mono text-lg font-bold text-indigo-700 tabular-nums">
                   {formatVnd(monthSummary?.laborCostVnd ?? 0)}
                 </dd>
@@ -1313,7 +1410,7 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
         </div>
       )}
 
-      {/* MOBILE BOTTOM NAVIGATION BAR (<= 15% height, >= 44px touch targets) */}
+      {/* MOBILE BOTTOM NAVIGATION BAR */}
       <nav
         aria-label="Điều hướng nhân viên"
         className="fixed right-0 bottom-0 left-0 z-40 grid h-16 grid-cols-3 border-t border-slate-200 bg-white/95 backdrop-blur-md pb-safe md:hidden"
@@ -1325,7 +1422,7 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
             activeTab === 'checkin' ? 'text-indigo-600' : 'text-slate-500'
           }`}
         >
-          <MapPin className="h-5 w-5" />
+          <Camera className="h-5 w-5" />
           <span className="text-[11px] font-semibold">Chấm công</span>
         </button>
         <button
@@ -1336,7 +1433,7 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
           }`}
         >
           <History className="h-5 w-5" />
-          <span className="text-[11px] font-semibold">Lịch sử</span>
+          <span className="text-[11px] font-semibold">Vào / Ra</span>
         </button>
         <button
           type="button"
@@ -1346,11 +1443,11 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
           }`}
         >
           <User className="h-5 w-5" />
-          <span className="text-[11px] font-semibold">Bảng công</span>
+          <span className="text-[11px] font-semibold">Cá nhân</span>
         </button>
       </nav>
 
-      {/* MULTI-STEP TAMPER-PROOF CHECK-IN / CHECK-OUT MOBILE BOTTOM SHEET */}
+      {/* UNIFIED 1-STEP CAMERA + GPS BOTTOM SHEET (OPENS CAMERA & CAPTURE BUTTON IMMEDIATELY) */}
       {flowStep !== 'idle' && (
         <div
           className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/75 backdrop-blur-xs sm:items-center sm:p-4"
@@ -1358,202 +1455,49 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
           aria-modal="true"
           aria-labelledby="attendance-flow-title"
         >
-          <div className="flex h-[92dvh] w-full max-w-xl flex-col overflow-hidden rounded-t-3xl border border-slate-200 bg-white sm:h-auto sm:max-h-[90dvh] sm:rounded-2xl">
+          <div className="flex h-[94dvh] w-full max-w-lg flex-col overflow-hidden rounded-t-3xl border border-slate-200 bg-white sm:h-auto sm:max-h-[92dvh] sm:rounded-2xl">
             {/* Mobile Sheet Drag Handle */}
             <div className="mx-auto mt-2.5 h-1 w-10 shrink-0 rounded-full bg-slate-300 sm:hidden" />
 
-            {/* Modal Header */}
-            <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-3 sm:px-5 sm:py-4">
+            {/* Clean Header */}
+            <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-3 sm:px-5">
               <div className="min-w-0">
                 <h2
                   id="attendance-flow-title"
                   className="truncate text-base font-bold text-slate-900"
                 >
                   {pendingAction === 'check_in'
-                    ? 'Xác thực Chấm công Vào ca'
-                    : 'Xác thực Chấm công Ra ca'}
+                    ? 'Chụp ảnh Chấm VÀO CA'
+                    : 'Chụp ảnh Chấm RA CA'}
                 </h2>
                 <p className="truncate text-xs text-slate-500">
-                  {employee.full_name} ({employee.employee_code})
+                  {employee.full_name}
                 </p>
               </div>
               <button
                 type="button"
                 onClick={closeFlow}
                 className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl text-slate-500 hover:bg-slate-100 hover:text-slate-900"
-                aria-label="Hủy quy trình chấm công"
+                aria-label="Đóng camera"
               >
                 <X className="h-5 w-5" />
               </button>
             </div>
 
-            {/* Scrollable Body */}
-            <div className="flex-1 space-y-4 overflow-y-auto p-4 sm:p-5">
-              {/* STEP 1: GPS & GEOFENCE LOCK */}
-              {(flowStep === 'gps_checking' || flowStep === 'gps_ready') && (
-                <div className="space-y-4">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-sm font-bold text-slate-900">
-                      Bước 1/2: Khóa tọa độ GPS
-                    </span>
-                    <button
-                      type="button"
-                      onClick={acquireGps}
-                      disabled={flowStep === 'gps_checking'}
-                      className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-                    >
-                      <RefreshCw
-                        className={`h-3.5 w-3.5 ${
-                          flowStep === 'gps_checking' ? 'animate-spin' : ''
-                        }`}
-                      />
-                      <span>Lấy lại GPS</span>
-                    </button>
-                  </div>
-
-                  {flowStep === 'gps_checking' && (
-                    <div className="flex flex-col items-center justify-center rounded-2xl border border-slate-200 bg-slate-50 px-4 py-10 text-center">
-                      <Navigation className="h-9 w-9 animate-pulse text-indigo-600" />
-                      <p className="mt-3 text-sm font-semibold text-slate-900">
-                        Đang đo tín hiệu GPS độ chính xác cao...
-                      </p>
-                      <p className="mt-1 text-xs text-slate-500">
-                        Yêu cầu sai số ≤ {settings.max_gps_accuracy_m}m
-                      </p>
-                    </div>
-                  )}
-
-                  {flowStep === 'gps_ready' && gpsError && (
-                    <div className="space-y-3 rounded-2xl border border-rose-200 bg-rose-50 p-4">
-                      <div className="flex items-start gap-2.5 text-sm text-rose-800">
-                        <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-rose-600" />
-                        <div>
-                          <p className="font-semibold">Không thể khóa vị trí GPS</p>
-                          <p className="mt-1 text-xs leading-relaxed">{gpsError}</p>
-                        </div>
-                      </div>
-                      {isDemoMode && (
-                        <button
-                          type="button"
-                          onClick={handleUseDemoOfficeGps}
-                          className="min-h-[48px] w-full rounded-xl border border-indigo-200 bg-white px-4 py-2.5 text-xs font-semibold text-indigo-700 hover:bg-indigo-50"
-                        >
-                          Dùng tọa độ điểm mẫu để tiếp tục kiểm thử (Chỉ Demo)
-                        </button>
-                      )}
-                    </div>
-                  )}
-
-                  {flowStep === 'gps_ready' && gpsReading && (
-                    <div className="space-y-3.5">
-                      <div className="grid grid-cols-2 gap-3 rounded-2xl border border-slate-200 bg-slate-50 p-3.5 sm:p-4">
-                        <div>
-                          <p className="text-xs text-slate-500">Sai số GPS</p>
-                          <p
-                            className={`mt-1 font-mono text-xl font-bold tabular-nums ${
-                              isAccuracyValid ? 'text-emerald-700' : 'text-rose-700'
-                            }`}
-                          >
-                            ±{gpsReading.accuracy}m
-                          </p>
-                          <p className="text-[11px] text-slate-500">
-                            Giới hạn ≤ {settings.max_gps_accuracy_m}m
-                          </p>
-                        </div>
-                        <div>
-                          <p className="text-xs text-slate-500">Khoảng cách điểm</p>
-                          <p
-                            className={`mt-1 font-mono text-xl font-bold tabular-nums ${
-                              isInsideGeofence ? 'text-emerald-700' : 'text-amber-700'
-                            }`}
-                          >
-                            {gpsReading.distance}m
-                          </p>
-                          <p className="text-[11px] text-slate-500">
-                            Cho phép ≤ {settings.geofence_radius_m}m
-                          </p>
-                        </div>
-                        <div className="col-span-2 border-t border-slate-200 pt-2.5">
-                          <p className="text-xs text-slate-500">Địa chỉ xác định</p>
-                          <p className="mt-0.5 text-xs leading-relaxed font-medium text-slate-900 sm:text-sm">
-                            {gpsReading.address}
-                          </p>
-                          <p className="mt-1 font-mono text-[11px] text-slate-500 tabular-nums">
-                            {gpsReading.latitude.toFixed(6)}, {gpsReading.longitude.toFixed(6)}
-                          </p>
-                        </div>
-                      </div>
-
-                      {!isAccuracyValid && (
-                        <div className="rounded-xl border border-rose-200 bg-rose-50 p-3.5 text-xs text-rose-800">
-                          <p className="font-bold">
-                            Từ chối chấm công: Sai số GPS (±{gpsReading.accuracy}m) vượt ngưỡng {settings.max_gps_accuracy_m}m.
-                          </p>
-                          <p className="mt-1">
-                            Vui lòng di chuyển ra khu vực thoáng hơn và nhấn &ldquo;Lấy lại GPS&rdquo;.
-                          </p>
-                        </div>
-                      )}
-
-                      {isAccuracyValid &&
-                        !isInsideGeofence &&
-                        !settings.allow_out_of_office_with_note && (
-                          <div className="rounded-xl border border-rose-200 bg-rose-50 p-3.5 text-xs text-rose-800">
-                            <p className="font-bold">
-                              Ngoài vùng Geofence cho phép ({gpsReading.distance}m &gt; {settings.geofence_radius_m}m).
-                            </p>
-                            <p className="mt-1">
-                              Quản trị viên hiện đang tắt chế độ chấm công ngoài khu vực.
-                            </p>
-                          </div>
-                        )}
-
-                      {requiresNote && (
-                        <div className="space-y-2 rounded-xl border border-amber-200 bg-amber-50 p-3.5">
-                          <label
-                            htmlFor="out-of-range-note"
-                            className="block text-xs font-bold text-amber-900"
-                          >
-                            Ngoài vùng quy định ({gpsReading.distance}m). Nhập lý do bắt buộc:
-                          </label>
-                          <textarea
-                            id="out-of-range-note"
-                            rows={2}
-                            value={outOfRangeNote}
-                            onChange={(e) => setOutOfRangeNote(e.target.value)}
-                            placeholder="Ví dụ: Hỗ trợ khu vực nhà hàng tầng 2..."
-                            className="w-full rounded-xl border border-amber-300 bg-white px-3 py-2 text-base text-slate-900 focus:border-indigo-600 focus:outline-none sm:text-sm"
-                          />
-                          <p className="text-[11px] text-amber-800">
-                            Tối thiểu 8 ký tự ({outOfRangeNote.trim().length}/8).
-                          </p>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* STEP 2 & 3: AUTO LIVE CAMERA (NO FILE UPLOAD) */}
+            {/* Body */}
+            <div className="flex-1 space-y-3 overflow-y-auto p-3.5 sm:p-5">
               {(flowStep === 'camera_live' || flowStep === 'submitting') && (
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm font-bold text-slate-900">
-                      Bước 2/2: Chụp ảnh xác thực
-                    </span>
-                    <span className="font-mono text-xs text-emerald-700 tabular-nums">
-                      GPS ±{gpsReading?.accuracy}m
-                    </span>
-                  </div>
-
+                <>
                   {submitError && (
                     <div className="rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-2.5 text-xs font-medium text-rose-700">
                       {submitError}
                     </div>
                   )}
 
+                  {/* LIVE CAMERA VIEWFINDER RIGHT AT TOP */}
                   {cameraError ? (
-                    <div className="space-y-3 rounded-2xl border border-rose-200 bg-rose-50 p-4">
+                    <div className="space-y-3 rounded-2xl border border-rose-200 bg-rose-50 p-4 text-center">
+                      <Camera className="mx-auto h-8 w-8 text-rose-600" />
                       <p className="text-xs font-medium text-rose-800">
                         {cameraError}
                       </p>
@@ -1561,17 +1505,18 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
                         <button
                           type="button"
                           onClick={openLiveCamera}
-                          className="min-h-[48px] flex-1 rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50"
+                          className="min-h-[46px] flex-1 rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs font-bold text-slate-800 hover:bg-slate-50"
                         >
-                          Thử mở lại Camera
+                          Bật lại Camera
                         </button>
                         {isDemoMode && (
                           <button
                             type="button"
+                            disabled={!canProceedToCapture}
                             onClick={() => handleCaptureAndConfirm(true)}
-                            className="min-h-[48px] flex-1 rounded-xl bg-indigo-600 px-4 py-2 text-xs font-semibold text-white hover:bg-indigo-700"
+                            className="min-h-[46px] flex-1 rounded-xl bg-indigo-600 px-4 py-2 text-xs font-bold text-white hover:bg-indigo-700 disabled:opacity-50"
                           >
-                            Tạo ảnh xác thực mẫu (Chỉ Demo)
+                            Chụp ảnh mẫu (Demo)
                           </button>
                         )}
                       </div>
@@ -1583,37 +1528,138 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
                         autoPlay
                         playsInline
                         muted
-                        className="aspect-[3/4] max-h-[48dvh] w-full -scale-x-100 object-cover sm:aspect-[4/3]"
+                        className="aspect-[3/4] max-h-[46dvh] w-full -scale-x-100 object-cover sm:aspect-[4/3]"
                       />
-                      <div className="absolute right-0 bottom-0 left-0 bg-gradient-to-t from-slate-950/90 to-transparent px-3.5 py-2.5 text-xs text-white">
-                        <p className="font-semibold">
-                          {employee.full_name} · {employee.employee_code}
-                        </p>
-                        <p className="font-mono text-[11px] text-slate-300 tabular-nums">
-                          {gpsReading?.latitude.toFixed(5)}, {gpsReading?.longitude.toFixed(5)} · Cách {gpsReading?.distance}m
+                      {!cameraReady && (
+                        <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-900/80 text-white">
+                          <Camera className="h-8 w-8 animate-pulse text-slate-300" />
+                          <p className="mt-2 text-xs font-medium text-slate-200">
+                            Đang mở camera trước...
+                          </p>
+                        </div>
+                      )}
+                      <div className="absolute right-0 bottom-0 left-0 bg-gradient-to-t from-slate-950/85 to-transparent px-3.5 py-2.5 text-xs text-white">
+                        <p className="font-semibold">{employee.full_name}</p>
+                        <p className="text-[11px] text-slate-300">
+                          {pendingAction === 'check_in' ? 'Vào ca' : 'Ra ca'} ·{' '}
+                          {vnTimeString}
                         </p>
                       </div>
                     </div>
                   )}
 
-                  <p className="text-center text-[11px] text-slate-500 sm:text-xs">
-                    Tự động đóng dấu thời gian thực, GPS & SHA-256. Không cho phép chọn ảnh có sẵn.
-                  </p>
-                </div>
+                  {/* SIMPLE LOCATION STATUS STRIP BELOW CAMERA */}
+                  {gpsLoading && (
+                    <div className="flex items-center gap-2.5 rounded-xl border border-slate-200 bg-slate-50 px-3.5 py-2.5 text-xs text-slate-700">
+                      <RefreshCw className="h-4 w-4 shrink-0 animate-spin text-indigo-600" />
+                      <span className="font-medium">
+                        Đang tự động xác định vị trí của bạn...
+                      </span>
+                    </div>
+                  )}
+
+                  {!gpsLoading && gpsError && (
+                    <div className="space-y-2.5 rounded-xl border border-rose-200 bg-rose-50 p-3 text-xs text-rose-800">
+                      <div className="flex items-start gap-2">
+                        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" />
+                        <p className="leading-relaxed font-medium">{gpsError}</p>
+                      </div>
+                      <div className="flex flex-col gap-2 sm:flex-row">
+                        <button
+                          type="button"
+                          onClick={acquireGps}
+                          className="min-h-[42px] flex-1 rounded-lg border border-rose-300 bg-white px-3 py-1.5 font-bold text-rose-800 hover:bg-rose-100"
+                        >
+                          Lấy lại vị trí
+                        </button>
+                        {isDemoMode && (
+                          <button
+                            type="button"
+                            onClick={handleUseDemoOfficeGps}
+                            className="min-h-[42px] flex-1 rounded-lg bg-indigo-600 px-3 py-1.5 font-bold text-white hover:bg-indigo-700"
+                          >
+                            Dùng vị trí mẫu (Demo)
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {!gpsLoading && gpsReading && (
+                    <div className="space-y-2.5">
+                      {!isAccuracyValid ? (
+                        <div className="flex items-center justify-between gap-2 rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-2.5 text-xs text-rose-800">
+                          <span>
+                            Vị trí chưa rõ (sai số ±{gpsReading.accuracy}m). Vui lòng ra chỗ thoáng.
+                          </span>
+                          <button
+                            type="button"
+                            onClick={acquireGps}
+                            className="shrink-0 rounded-lg border border-rose-300 bg-white px-2.5 py-1.5 font-bold text-rose-800"
+                          >
+                            Thử lại
+                          </button>
+                        </div>
+                      ) : isInsideGeofence ? (
+                        <div className="flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-3.5 py-2.5 text-xs font-semibold text-emerald-800">
+                          <MapPin className="h-4 w-4 shrink-0 text-emerald-600" />
+                          <span className="truncate">
+                            Đúng vị trí làm việc · Cách điểm {gpsReading.distance}m
+                          </span>
+                        </div>
+                      ) : settings.allow_out_of_office_with_note ? (
+                        <div className="space-y-1.5 rounded-xl border border-amber-200 bg-amber-50 p-3">
+                          <label
+                            htmlFor="out-of-range-note"
+                            className="block text-xs font-bold text-amber-900"
+                          >
+                            Bạn đang ở ngoài khu vực (cách {gpsReading.distance}m). Nhập lý do:
+                          </label>
+                          <input
+                            id="out-of-range-note"
+                            type="text"
+                            value={outOfRangeNote}
+                            onChange={(e) => setOutOfRangeNote(e.target.value)}
+                            placeholder="Ví dụ: Làm tại nhà hàng tầng 2..."
+                            className="min-h-[44px] w-full rounded-lg border border-amber-300 bg-white px-3 py-2 text-base text-slate-900 focus:border-indigo-600 focus:outline-none sm:text-sm"
+                          />
+                          <p className="text-[11px] text-amber-800">
+                            Nhập ít nhất 8 ký tự ({outOfRangeNote.trim().length}/8)
+                          </p>
+                        </div>
+                      ) : (
+                        <div className="flex items-center justify-between gap-2 rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-2.5 text-xs font-semibold text-rose-800">
+                          <span>
+                            Bạn đang ở ngoài khu vực làm việc (cách {gpsReading.distance}m).
+                          </span>
+                          <button
+                            type="button"
+                            onClick={acquireGps}
+                            className="shrink-0 rounded-lg border border-rose-300 bg-white px-2.5 py-1.5 font-bold"
+                          >
+                            Kiểm tra lại
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </>
               )}
 
-              {/* STEP 4: RECEIPT CONFIRMATION */}
+              {/* RECEIPT CONFIRMATION */}
               {flowStep === 'receipt' && receiptLog && (
                 <div className="space-y-3.5">
-                  <div className="flex items-center gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-3.5">
-                    <CheckCircle2 className="h-7 w-7 shrink-0 text-emerald-600" />
+                  <div className="flex items-center gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
+                    <CheckCircle2 className="h-8 w-8 shrink-0 text-emerald-600" />
                     <div>
-                      <p className="text-sm font-bold text-emerald-900">
-                        Điểm danh thành công!
+                      <p className="text-base font-bold text-emerald-900">
+                        {receiptLog.action === 'check_in'
+                          ? 'Đã lưu CHẤM VÀO CA thành công!'
+                          : 'Đã lưu CHẤM RA CA thành công!'}
                       </p>
-                      <p className="text-xs text-emerald-800">
-                        Giờ máy chủ:{' '}
-                        <span className="font-mono font-semibold tabular-nums">
+                      <p className="mt-0.5 text-xs text-emerald-800">
+                        Giờ ghi nhận:{' '}
+                        <span className="font-mono font-bold tabular-nums">
                           {formatDateTimeVN(receiptLog.server_timestamp)}
                         </span>
                       </p>
@@ -1623,23 +1669,23 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
                   <div className="overflow-hidden rounded-2xl border border-slate-200 bg-slate-900">
                     <img
                       src={receiptLog.photo_url}
-                      alt="Ảnh xác thực đã đóng dấu pháp lý"
+                      alt="Ảnh chấm công đã lưu"
                       referrerPolicy="no-referrer"
-                      className="aspect-[4/3] max-h-[42dvh] w-full object-cover"
+                      className="aspect-[4/3] max-h-[40dvh] w-full object-cover"
                     />
                   </div>
 
-                  <div className="space-y-1.5 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs">
-                    <div className="flex justify-between">
-                      <span className="text-slate-500">Mã bản ghi:</span>
-                      <span className="font-mono font-semibold text-slate-900">
-                        {receiptLog.id}
+                  <div className="space-y-1.5 rounded-xl border border-slate-200 bg-slate-50 p-3.5 text-xs">
+                    <div className="flex justify-between gap-2">
+                      <span className="text-slate-500">Họ và tên:</span>
+                      <span className="font-bold text-slate-900">
+                        {receiptLog.employee_name}
                       </span>
                     </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-500">Mã băm SHA-256:</span>
-                      <span className="font-mono text-slate-700">
-                        {receiptLog.integrity_hash.slice(0, 18)}...
+                    <div className="flex justify-between gap-2">
+                      <span className="text-slate-500">Địa điểm:</span>
+                      <span className="max-w-[68%] truncate text-right text-slate-800">
+                        {receiptLog.address_text}
                       </span>
                     </div>
                   </div>
@@ -1647,37 +1693,28 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
               )}
             </div>
 
-            {/* STICKY THUMB-ZONE ACTION FOOTER (Always reachable on small phone screens) */}
-            {(flowStep === 'gps_ready' && gpsReading) ||
-            ((flowStep === 'camera_live' || flowStep === 'submitting') && !cameraError) ||
+            {/* STICKY THUMB-ZONE CAPTURE BUTTON (VISIBLE IMMEDIATELY WHEN CAMERA OPENS) */}
+            {((flowStep === 'camera_live' || flowStep === 'submitting') && !cameraError) ||
             (flowStep === 'receipt' && receiptLog) ? (
               <div className="shrink-0 border-t border-slate-200 bg-white px-4 py-3 pb-safe sm:px-5 sm:py-4">
-                {flowStep === 'gps_ready' && gpsReading && (
-                  <button
-                    type="button"
-                    disabled={!canProceedToCamera}
-                    onClick={openLiveCamera}
-                    className="flex min-h-[54px] w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-5 py-3 text-base font-bold text-white transition-colors hover:bg-indigo-700 active:scale-[0.99] disabled:cursor-not-allowed disabled:bg-slate-300"
-                  >
-                    <Camera className="h-5 w-5" />
-                    <span>Mở Camera Trực Tiếp (Bước 2/2)</span>
-                  </button>
-                )}
-
                 {(flowStep === 'camera_live' || flowStep === 'submitting') &&
                   !cameraError && (
                     <button
                       type="button"
-                      disabled={!cameraReady || flowStep === 'submitting'}
+                      disabled={
+                        !cameraReady ||
+                        !canProceedToCapture ||
+                        flowStep === 'submitting'
+                      }
                       onClick={() => handleCaptureAndConfirm(false)}
-                      className="flex min-h-[56px] w-full items-center justify-center gap-2 rounded-xl bg-emerald-600 px-5 py-3 text-base font-bold text-white transition-colors hover:bg-emerald-700 active:scale-[0.99] disabled:opacity-60"
+                      className={`flex min-h-[58px] w-full items-center justify-center gap-2.5 rounded-2xl px-5 py-3.5 text-base font-bold text-white transition-all active:scale-[0.99] disabled:cursor-not-allowed disabled:bg-slate-300 disabled:text-slate-600 ${
+                        pendingAction === 'check_in'
+                          ? 'bg-emerald-600 hover:bg-emerald-700'
+                          : 'bg-indigo-600 hover:bg-indigo-700'
+                      }`}
                     >
-                      <Camera className="h-5 w-5" />
-                      <span>
-                        {flowStep === 'submitting'
-                          ? 'Đang đóng dấu SHA-256 & lưu...'
-                          : 'Chụp ảnh & Xác nhận'}
-                      </span>
+                      <Camera className="h-6 w-6 shrink-0" />
+                      <span>{captureButtonLabel}</span>
                     </button>
                   )}
 
@@ -1685,9 +1722,9 @@ export const EmployeeAttendanceView: React.FC<EmployeeAttendanceViewProps> = ({
                   <button
                     type="button"
                     onClick={closeFlow}
-                    className="min-h-[52px] w-full rounded-xl bg-indigo-600 px-5 py-3 text-base font-bold text-white hover:bg-indigo-700 active:scale-[0.99]"
+                    className="min-h-[54px] w-full rounded-2xl bg-[#0B1E36] px-5 py-3 text-base font-bold text-white hover:bg-[#132C4E] active:scale-[0.99]"
                   >
-                    Hoàn tất
+                    Xong
                   </button>
                 )}
               </div>

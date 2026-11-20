@@ -1,0 +1,6 @@
+{
+  "name": "Chấm Công GPS & Chi Phí Nhân Công",
+  "description": "Hệ thống chấm công xác thực GPS, ảnh chụp trực tiếp chống giả mạo và quản lý chi phí nhân công theo thời gian thực.",
+  "requestFramePermissions": ["camera", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
